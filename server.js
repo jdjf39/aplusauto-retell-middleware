@@ -104,36 +104,33 @@ async function scrapeInventorySearch(year, make, model, partType) {
 
 async function scrapeSearchResultsPage(year, make, model, partType) {
   try {
-    // Try the product category page with search params
-    let url = `${BASE_URL}/product-category/iis-auto-parts/`;
-    const params = {};
-    if (year || make || model || partType) {
-      // Try WooCommerce product search
-      url = `${BASE_URL}/?s=${encodeURIComponent(
-        [year, make, model, partType].filter(Boolean).join(" ")
-      )}&post_type=product`;
-    }
+    // Search using WordPress search with product post type
+    const searchTerms = [year, make, model, partType].filter(Boolean).join(" ");
+    const url = `${BASE_URL}/?s=${encodeURIComponent(searchTerms)}&post_type=product`;
+
+    console.log("Scraping search URL:", url);
 
     const response = await axios.get(url, {
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
       },
-      timeout: 10000,
+      timeout: 15000,
     });
 
     const $ = cheerio.load(response.data);
     const products = [];
 
-    // Parse WooCommerce product listings
-    $(".product, .iis-part, .woocommerce-loop-product").each((i, el) => {
+    // Try multiple selectors that WooCommerce sites commonly use
+    $(".product, li.product, .wc-block-grid__product, article.product").each((i, el) => {
       const name =
-        $(el).find(".woocommerce-loop-product__title, h2, .part-title").text().trim() || "";
+        $(el).find(".woocommerce-loop-product__title, h2, h3, .product-title, .woocommerce-loop-category__title").text().trim() || "";
       const price =
-        $(el).find(".price, .amount").first().text().trim() || "Call for price";
+        $(el).find(".price, .amount, .woocommerce-Price-amount").first().text().trim() || "Call for price";
       const link = $(el).find("a").first().attr("href") || "";
       const image = $(el).find("img").first().attr("src") || "";
-      const sku = $(el).find(".sku, [data-sku]").text().trim() || "";
 
       if (name) {
         products.push({
@@ -141,15 +138,76 @@ async function scrapeSearchResultsPage(year, make, model, partType) {
           price,
           url: link,
           image,
-          sku,
           in_stock: true,
         });
       }
     });
 
+    // Also check for any search results in general format
+    if (products.length === 0) {
+      $("article, .search-result, .entry").each((i, el) => {
+        const name = $(el).find("h2, h3, .entry-title").text().trim();
+        const link = $(el).find("a").first().attr("href") || "";
+        if (name && (name.toLowerCase().includes(make?.toLowerCase() || "") || name.toLowerCase().includes(model?.toLowerCase() || ""))) {
+          products.push({
+            name,
+            price: "Call for price",
+            url: link,
+            in_stock: true,
+          });
+        }
+      });
+    }
+
+    console.log(`Scrape found ${products.length} products`);
     return products;
   } catch (error) {
     console.log("Page scrape failed:", error.message);
+    return [];
+  }
+}
+
+// ============================================================
+// APPROACH 5: Search homepage vehicles and match to caller request
+// ============================================================
+async function searchHomepageVehicles(year, make, model) {
+  try {
+    const response = await axios.get(BASE_URL, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+      timeout: 15000,
+    });
+
+    const $ = cheerio.load(response.data);
+    const vehicles = [];
+
+    // Parse the latest arrivals from the homepage
+    $("h5, h4, h3").each((i, el) => {
+      const text = $(el).text().trim();
+      if (text && /^\d{4}\s/.test(text)) {
+        vehicles.push(text);
+      }
+    });
+
+    // Also grab stock numbers
+    $("*:contains('STK#')").each((i, el) => {
+      const text = $(el).text().trim();
+      if (text.includes("STK#") && text.length < 200) {
+        vehicles.push(text);
+      }
+    });
+
+    const searchTerms = [year, make, model].filter(Boolean).map(t => t.toLowerCase());
+    const matches = vehicles.filter(v => 
+      searchTerms.every(term => v.toLowerCase().includes(term))
+    );
+
+    console.log(`Homepage search: found ${vehicles.length} vehicles, ${matches.length} matches`);
+    return matches;
+  } catch (error) {
+    console.log("Homepage vehicle search failed:", error.message);
     return [];
   }
 }
@@ -214,7 +272,9 @@ async function searchProductCategories(searchTerm) {
 // This is what your Retell agent calls
 // ============================================================
 app.post("/search-parts", async (req, res) => {
-  const { year, make, model, part_type, query } = req.body;
+  // Retell sends data inside req.body.args
+  const args = req.body.args || req.body;
+  const { year, make, model, part_type, query } = args;
 
   console.log("Search request received:", { year, make, model, part_type, query });
 
@@ -251,6 +311,19 @@ app.post("/search-parts", async (req, res) => {
     }
   }
 
+  // Strategy 4: Check homepage vehicles for matches
+  if (results.length === 0 && (year || make || model)) {
+    const vehicleMatches = await searchHomepageVehicles(year, make, model);
+    if (vehicleMatches.length > 0) {
+      results = vehicleMatches.map(v => ({
+        name: v,
+        price: "Call for price",
+        in_stock: true,
+      }));
+      searchMethod = "homepage_vehicle_match";
+    }
+  }
+
   // Format response for Retell
   if (results.length > 0) {
     const topResults = results.slice(0, 5); // Limit to top 5 for voice
@@ -262,23 +335,18 @@ app.post("/search-parts", async (req, res) => {
         if (r.in_stock === false) line += " [OUT OF STOCK]";
         return line;
       })
-      .join("\n");
+      .join(". ");
 
-    res.json({
-      success: true,
-      count: results.length,
-      search_method: searchMethod,
-      message: `I found ${results.length} part${results.length > 1 ? "s" : ""} matching your search. Here are the top results:\n${resultText}`,
-      results: topResults,
-      all_results_count: results.length,
-    });
+    // Retell works best with a simple string response
+    const message = `I found ${results.length} result${results.length > 1 ? "s" : ""} matching your search. ${resultText}. All parts come with a 1-year warranty and ship within one business day.`;
+    
+    console.log("Returning results:", message);
+    res.json(message);
   } else {
-    res.json({
-      success: false,
-      count: 0,
-      message: `I wasn't able to find that specific part in the online inventory right now. I can take down your information and have our parts team check our full warehouse inventory and get back to you. We have over 100,000 parts in stock. Would you like me to submit an inquiry for you?`,
-      results: [],
-    });
+    const message = `I wasn't able to find that specific part in our online inventory right now. But we have a huge warehouse with over 100,000 parts, so there's a good chance we have it. I can take down your information and have our parts team check and get back to you within a couple hours. Would you like me to do that?`;
+    
+    console.log("No results found, returning fallback message");
+    res.json(message);
   }
 });
 
@@ -286,7 +354,9 @@ app.post("/search-parts", async (req, res) => {
 // VEHICLE LOOKUP: Check if a specific vehicle is in inventory
 // ============================================================
 app.post("/check-vehicle", async (req, res) => {
-  const { year, make, model } = req.body;
+  // Retell sends data inside req.body.args
+  const args = req.body.args || req.body;
+  const { year, make, model } = args;
   const searchQuery = [year, make, model].filter(Boolean).join(" ");
 
   console.log("Vehicle check:", searchQuery);
@@ -322,25 +392,12 @@ app.post("/check-vehicle", async (req, res) => {
     );
 
     if (matches.length > 0) {
-      res.json({
-        success: true,
-        message: `Yes! We have ${matches.length} ${searchQuery} vehicle${matches.length > 1 ? "s" : ""} in our inventory. The parts from ${matches.length > 1 ? "these vehicles are" : "this vehicle is"} available. Would you like me to look up a specific part?`,
-        vehicles: matches,
-      });
+      res.json(`Yes! We have ${matches.length} ${searchQuery} vehicle${matches.length > 1 ? "s" : ""} in our inventory. The parts from ${matches.length > 1 ? "these vehicles are" : "this vehicle is"} available. Would you like me to look up a specific part?`);
     } else {
-      res.json({
-        success: true,
-        message: `I don't see a ${searchQuery} in our most recent arrivals, but we have a large warehouse with over 100,000 parts. We may still have parts from that vehicle. Would you like me to check with our parts team?`,
-        vehicles: [],
-      });
+      res.json(`I don't see a ${searchQuery} in our most recent arrivals, but we have a large warehouse with over 100,000 parts. We may still have parts from that vehicle. Would you like me to check with our parts team?`);
     }
   } catch (error) {
-    res.json({
-      success: false,
-      message:
-        "I'm having trouble checking inventory right now. Let me take down your information and have our team get back to you.",
-      vehicles: [],
-    });
+    res.json("I'm having trouble checking inventory right now. Let me take down your information and have our team get back to you.");
   }
 });
 
@@ -348,7 +405,9 @@ app.post("/check-vehicle", async (req, res) => {
 // PART INQUIRY: Submit a part inquiry form
 // ============================================================
 app.post("/submit-inquiry", async (req, res) => {
-  const { customer_name, email, phone, year, make, model, part_needed, message } = req.body;
+  // Retell sends data inside req.body.args
+  const args = req.body.args || req.body;
+  const { customer_name, email, phone, year, make, model, part_needed, message } = args;
 
   console.log("Part inquiry submission:", { customer_name, phone, part_needed });
 
@@ -359,19 +418,7 @@ app.post("/submit-inquiry", async (req, res) => {
   // 4. Create a lead in your system
 
   // For now, log and confirm
-  res.json({
-    success: true,
-    message: `I've submitted your inquiry for a ${[year, make, model, part_needed].filter(Boolean).join(" ")}. Our parts team will reach out to you at ${phone || email} shortly. Our hours are Monday through Friday, 8:30 AM to 6 PM, and Saturday 9 AM to noon. Is there anything else I can help you with?`,
-    inquiry: {
-      customer_name,
-      email,
-      phone,
-      vehicle: `${year} ${make} ${model}`,
-      part_needed,
-      message,
-      submitted_at: new Date().toISOString(),
-    },
-  });
+  res.json(`I've submitted your inquiry for a ${[year, make, model, part_needed].filter(Boolean).join(" ")}. Our parts team will reach out to you at ${phone || email} shortly. Our hours are Monday through Friday, 8:30 AM to 6 PM, and Saturday 9 AM to noon. Is there anything else I can help you with?`);
 });
 
 // ============================================================
