@@ -326,27 +326,24 @@ app.post("/search-parts", async (req, res) => {
 
   // Format response for Retell
   if (results.length > 0) {
-    const topResults = results.slice(0, 5); // Limit to top 5 for voice
-    const resultText = topResults
-      .map((r, i) => {
-        let line = `${i + 1}. ${r.name}`;
-        if (r.price && r.price !== "Call for price") line += ` - ${r.price}`;
-        if (r.sku) line += ` (SKU: ${r.sku})`;
-        if (r.in_stock === false) line += " [OUT OF STOCK]";
-        return line;
-      })
-      .join(". ");
-
-    // Retell works best with a simple string response
-    const message = `I found ${results.length} result${results.length > 1 ? "s" : ""} matching your search. ${resultText}. All parts come with a 1-year warranty and ship within one business day.`;
+    const topResults = results.slice(0, 3);
+    const first = topResults[0];
+    let message = "";
+    
+    if (first.price && first.price !== "Call for price") {
+      message = `Found: ${first.name} - ${first.price}. In stock.`;
+    } else {
+      message = `Found: ${first.name}. In stock. Price available upon request.`;
+    }
+    
+    if (topResults.length > 1) {
+      message += ` Plus ${topResults.length - 1} more option${topResults.length - 1 > 1 ? 's' : ''}.`;
+    }
     
     console.log("Returning results:", message);
     res.json(message);
   } else {
-    const message = `I wasn't able to find that specific part in our online inventory right now. But we have a huge warehouse with over 100,000 parts, so there's a good chance we have it. I can take down your information and have our parts team check and get back to you within a couple hours. Would you like me to do that?`;
-    
-    console.log("No results found, returning fallback message");
-    res.json(message);
+    res.json("Part not found in online inventory. We have 100,000+ parts in our warehouse. Offer to take their info and have the parts team check.");
   }
 });
 
